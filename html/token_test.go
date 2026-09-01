@@ -626,6 +626,16 @@ var tokenTests = []tokenTest{
 		`<p a=/>`,
 		`<p a="/">`,
 	},
+	{
+		"duplicate attributes",
+		`<p foo="bar" foo="baz">`,
+		`<p foo="bar">`,
+	},
+	{
+		"duplicate attributes, different case",
+		`<p FOO="bar" foo="baz">`,
+		`<p foo="bar">`,
+	},
 }
 
 func TestTokenizer(t *testing.T) {
@@ -933,3 +943,90 @@ func benchmarkTokenizer(b *testing.B, level int) {
 func BenchmarkRawLevelTokenizer(b *testing.B)  { benchmarkTokenizer(b, rawLevel) }
 func BenchmarkLowLevelTokenizer(b *testing.B)  { benchmarkTokenizer(b, lowLevel) }
 func BenchmarkHighLevelTokenizer(b *testing.B) { benchmarkTokenizer(b, highLevel) }
+
+func TestUnicodeAttributeCase(t *testing.T) {
+	// <div a="1" A="1"> is resolved to <div a="1"> because a and A are considered
+	// duplicate attribute names. Different unicode cases are not considered equal
+	// though, so <div ä="1" Ä="1"> is tokenized as <div ä="1" Ä="1">.
+	f := `<div ä="1" Ä="1">`
+	z := NewTokenizer(strings.NewReader(f))
+	if tt := z.Next(); tt != StartTagToken {
+		t.Fatalf("expected StartTagToken, got %s", tt)
+	}
+	tok := z.Token()
+	if len(tok.Attr) != 2 {
+		t.Fatalf("expected 2 attributes, got %d", len(tok.Attr))
+	}
+	if tok.Attr[0].Key != "ä" {
+		t.Errorf("expected attribute key to be 'ä', got %s", tok.Attr[0].Key)
+	}
+	if tok.Attr[1].Key != "Ä" {
+		t.Errorf("expected attribute key to be 'Ä', got %s", tok.Attr[1].Key)
+	}
+}
+
+func TestDuplicateAttributeSmuggling(t *testing.T) {
+	// Duplicate attribute names are a parse error: all but the first occurrence
+	// must be dropped, matching what browsers do. Keeping them lets an attacker
+	// smuggle a second, unsanitized value past a filter that only inspects the
+	// first occurrence of each name.
+	const in = `<img src="safe.png" SRC="javascript:alert(1)" onerror=safe ONERROR="alert(1)">`
+
+	// Low-level TagAttr API.
+	z := NewTokenizer(strings.NewReader(in))
+	if tt := z.Next(); tt != StartTagToken {
+		t.Fatalf("Next: got %s, want %s", tt, StartTagToken)
+	}
+	var keys []string
+	for more := true; more; {
+		var key, val []byte
+		key, val, more = z.TagAttr()
+		keys = append(keys, string(key))
+		if strings.Contains(string(val), "alert(1)") {
+			t.Errorf("TagAttr: duplicate %q smuggled value %q", key, val)
+		}
+	}
+	if want := []string{"src", "onerror"}; !reflect.DeepEqual(keys, want) {
+		t.Errorf("TagAttr keys: got %q, want %q", keys, want)
+	}
+
+	// The dedup key is lowered on a copy of the buffer, so Raw still reproduces
+	// the input byte for byte. Lowering in place would rewrite the raw bytes.
+	z = NewTokenizer(strings.NewReader(in))
+	if tt := z.Next(); tt != StartTagToken {
+		t.Fatalf("Next: got %s, want %s", tt, StartTagToken)
+	}
+	if got := string(z.Raw()); got != in {
+		t.Errorf("Raw: got %q, want %q", got, in)
+	}
+
+	// Same input through the full parser, the shape a sanitizer uses.
+	doc, err := Parse(strings.NewReader(in))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	var img *Node
+	var walk func(*Node)
+	walk = func(n *Node) {
+		if n.Type == ElementNode && n.Data == "img" {
+			img = n
+		}
+		for c := n.FirstChild; c != nil; c = c.NextSibling {
+			walk(c)
+		}
+	}
+	walk(doc)
+	if img == nil {
+		t.Fatal("Parse: no img element in the tree")
+	}
+	keys = nil
+	for _, a := range img.Attr {
+		keys = append(keys, a.Key)
+		if strings.Contains(a.Val, "alert(1)") {
+			t.Errorf("Parse: attribute %q kept smuggled value %q", a.Key, a.Val)
+		}
+	}
+	if want := []string{"src", "onerror"}; !reflect.DeepEqual(keys, want) {
+		t.Errorf("Parse: attribute keys: got %q, want %q", keys, want)
+	}
+}
